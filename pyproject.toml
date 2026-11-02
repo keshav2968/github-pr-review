@@ -1,11 +1,44 @@
 [project]
 name = "github-pr-review"
 version = "0.1.0"
+description = "Agentic GitHub PR reviewer: LangGraph state machine + MCP tools + sandboxed tests."
+readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.139.2",
     "langchain>=1.3.14",
     "pydantic>=2.13.4",
+    "pydantic-settings>=2.16.2",
+    "python-dotenv>=1.2.4",
     "rich>=15.0.0",
     "typer>=0.27.0",
+    "unidiff>=1.0.1",
 ]
+
+[project.scripts]
+pr-review = "pr_review.cli:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pr_review"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0",
+    "pytest-asyncio>=1.4.1.post1",
+    "ruff>=0.17.3",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM"]

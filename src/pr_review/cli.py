@@ -1,3 +1,4 @@
+import logging
 import shutil
 import subprocess
 import sys
@@ -5,61 +6,86 @@ import sys
 import typer
 from dotenv import load_dotenv
 from rich.console import Console
+from rich.panel import Panel
 from rich.table import Table
 
 from pr_review.config import get_settings
-from pr_review.github.diff import parse_diff
 from pr_review.github.gh_client import GitHubClient, GitHubClientError
 
 app = typer.Typer(help="AI-powered GitHub PR review agent.", no_args_is_help=True)
 console = Console()
 
+DEFAULT_FOCUS = "Review this PR for correctness, bugs, security problems and missing tests."
+
 
 @app.callback()
-def main() -> None:
+def main(verbose: bool = typer.Option(False, "--verbose", "-v", help="Show debug logs.")) -> None:
     # Load .env into os.environ so libraries that read env vars directly
     # (e.g. langsmith reads LANGSMITH_API_KEY) see the same values as Settings.
     load_dotenv()
+    logging.basicConfig(level=logging.INFO if verbose else logging.WARNING, format="%(message)s")
 
 
 @app.command()
 def review(
     pr_number: int = typer.Argument(..., help="GitHub pull request number."),
     repo: str | None = typer.Option(None, "--repo", help="owner/repo (default: current folder)."),
-    dry_run: bool = typer.Option(
-        True,
-        "--dry-run/--publish",
-        help="Print results locally instead of posting to GitHub.",
+    focus: str = typer.Option(
+        DEFAULT_FOCUS, "--focus", "--request", "-r", help="What the reviewer should focus on."
     ),
+    dry_run: bool = typer.Option(
+        True, "--dry-run/--publish", help="Print results locally instead of posting to GitHub."
+    ),
+    fresh: bool = typer.Option(False, "--fresh", help="Ignore any saved result for this commit."),
 ) -> None:
-    """Review a pull request."""
-    client = GitHubClient(repository=repo or get_settings().github_repository)
+    """Review a pull request (dry run by default)."""
+    from pr_review.agent.run import run_review
+    from pr_review.llm.structured import StructuredLLM
+
+    settings = get_settings()
+    if settings.llm_api_key is None:
+        console.print("[red]LLM_API_KEY is not set.[/red] Run `pr-review doctor` for setup help.")
+        raise typer.Exit(1)
+    github = GitHubClient(repository=repo or settings.github_repository)
     try:
-        pr = client.get_pull_request(pr_number)
-        files = parse_diff(client.get_pull_request_diff(pr_number))
+        with console.status("Reviewing..."):
+            outcome = run_review(
+                settings=settings,
+                github=github,
+                llm=StructuredLLM(settings),
+                pr_number=pr_number,
+                focus=focus,
+                dry_run=dry_run,
+                fresh=fresh,
+            )
     except GitHubClientError as error:
         console.print(f"[red]GitHub error:[/red] {error}")
         raise typer.Exit(1) from error
 
-    console.print(f"[bold]{pr.repository}#{pr.number}[/bold] {pr.title}")
+    state = outcome.state
+    pr, result = state["pr"], state["review"]
     console.print(
-        f"head {pr.head_sha[:8]} -> base {pr.base_sha[:8]} | +{pr.additions} -{pr.deletions}"
+        f"[bold]{pr.repository}#{pr.number}[/bold] {pr.title}  [dim]({outcome.status})[/dim]"
     )
-    table = Table("file", "added", "commentable lines", "flags")
-    for fd in files.values():
-        flags = ",".join(
-            name
-            for name, on in [
-                ("new", fd.is_new),
-                ("deleted", fd.is_deleted),
-                ("renamed", fd.is_renamed),
-                ("binary", fd.is_binary),
-            ]
-            if on
-        )
-        table.add_row(fd.path, str(fd.additions), str(len(fd.commentable_lines)), flags)
+    console.print(result.summary)
+    for c in result.comments:
+        console.print(Panel(c.render(), title=f"{c.path}:{c.line}", title_align="left"))
+
+    table = Table("metric", "value", title="run details")
+    table.add_row("candidate issues", str(len(state.get("candidates", []))))
+    table.add_row("posted comments", str(len(result.comments)))
+    for reason, n in (state.get("drops") or {}).items():
+        table.add_row(f"  filtered: {reason}", str(n))
+    for key in ("calls", "schema_valid_rate", "repairs", "retries", "prompt_tokens", "latency_s"):
+        if key in outcome.llm_stats:
+            table.add_row(f"llm {key}", f"{outcome.llm_stats[key]:.2f}".rstrip("0").rstrip("."))
+    for error in state.get("errors", []):
+        table.add_row("[yellow]error[/yellow]", error[:120])
+    if not dry_run:
+        table.add_row("publish", state.get("publish_note", ""))
+    table.add_row("thread", outcome.thread_id)
+    table.add_row("langsmith", outcome.trace_url or f"run id {outcome.run_id}")
     console.print(table)
-    console.print(f"Mode: {'dry-run' if dry_run else 'publish'} (agent arrives in step 2)")
 
 
 def _check(cmd: list[str]) -> tuple[bool, str]:
@@ -73,8 +99,28 @@ def _check(cmd: list[str]) -> tuple[bool, str]:
     return r.returncode == 0, msg[0] if msg else ""
 
 
+def _check_llm() -> tuple[bool, str]:
+    """One tiny real structured call: proves key, model name and JSON schema all work."""
+    from pydantic import BaseModel
+
+    from pr_review.llm.structured import StructuredLLM
+
+    class Ping(BaseModel):
+        answer: int
+
+    llm = StructuredLLM(get_settings())
+    try:
+        out = llm.generate([{"role": "user", "content": "What is 2 + 3?"}], Ping, name="doctor")
+    except Exception as error:
+        return False, str(error).splitlines()[0][:80]
+    mode = "schema mode" if llm.schema_supported else "JSON-mode fallback"
+    return out.answer == 5, f"2+3={out.answer} ({mode})"
+
+
 @app.command()
-def doctor() -> None:
+def doctor(
+    live: bool = typer.Option(False, "--live", help="Also make one real (free) LLM call."),
+) -> None:
     """Check that everything this project needs is installed and configured."""
     s = get_settings()
     checks: list[tuple[str, bool, str, str]] = []  # name, ok, detail, how to fix
@@ -88,14 +134,20 @@ def doctor() -> None:
     ok, detail = _check(["docker", "info", "--format", "{{.ServerVersion}}"])
     checks.append(("docker running", ok, detail, "start Docker Desktop (needed for test sandbox)"))
 
+    key_ok = s.llm_api_key is not None
     checks.append(
         (
             "LLM_API_KEY set",
-            s.llm_api_key is not None,
+            key_ok,
             s.llm_model,
             "get a key at https://aistudio.google.com and put it in .env",
         )
     )
+    if live and key_ok:
+        ok, detail = _check_llm()
+        checks.append(
+            ("LLM structured call", ok, detail, "check LLM_MODEL is a model your key can use")
+        )
     checks.append(
         (
             "LANGSMITH_API_KEY set",
